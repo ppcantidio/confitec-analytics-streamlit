@@ -9,6 +9,7 @@ O aplicativo permite fazer upload do arquivo CSV e visualiza o relatório de hor
 
 from __future__ import annotations
 
+import datetime
 import re
 
 import pandas as pd
@@ -229,6 +230,20 @@ def prepare_tasks_data(df):
     # Flag para tarefas sem estimativa
     df["has_estimate"] = df["planned_hours"] > 0
 
+    # Garantir que colunas de texto sejam string e limpar valores NaN
+    text_columns = [
+        "state",
+        "story.epic",
+        "assigned_to",
+        "story.sprint",
+        "short_description",
+        "number",
+        "story.number",
+    ]
+    for col in text_columns:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+
     # Interpreta datas onde disponíveis
     if (
         "story.sprint.start_date" in df.columns
@@ -251,6 +266,121 @@ def prepare_tasks_data(df):
             pass
 
     return df
+
+
+def validate_and_clean_hours_data(df, show_debug=False):
+    """
+    Valida e limpa os dados de horas antes do processamento.
+    Garante que os formatos estejam corretos e identifica possíveis problemas.
+    """
+    df_clean = df.copy()
+
+    # Aplicar parsing e verificar resultados
+    df_clean["planned_hours"] = df_clean["u_horas_planejadas"].apply(_parse_hours)
+    df_clean["real_hours"] = df_clean["u_horas_reais"].apply(_parse_hours)
+
+    # Identificar problemas
+    zero_planned = (df_clean["planned_hours"] == 0).sum()
+    zero_real = (df_clean["real_hours"] == 0).sum()
+    total_rows = len(df_clean)
+
+    # Verificar se há valores negativos (não deveria haver)
+    negative_planned = (df_clean["planned_hours"] < 0).sum()
+    negative_real = (df_clean["real_hours"] < 0).sum()
+
+    # Mostrar debug apenas se solicitado ou se há problemas
+    has_issues = (
+        zero_planned > total_rows * 0.3
+        or zero_real > total_rows * 0.3
+        or negative_planned > 0
+        or negative_real > 0
+    )
+
+    if show_debug or has_issues:
+        print("🔍 Debug - Validando dados de horas:")
+        print(
+            "Exemplos de horas planejadas (originais):",
+            df_clean["u_horas_planejadas"].head(5).tolist(),
+        )
+        print(
+            "Exemplos de horas reais (originais):",
+            df_clean["u_horas_reais"].head(5).tolist(),
+        )
+        print(
+            "Exemplos de horas planejadas (convertidas):",
+            df_clean["planned_hours"].head(5).tolist(),
+        )
+        print(
+            "Exemplos de horas reais (convertidas):",
+            df_clean["real_hours"].head(5).tolist(),
+        )
+
+        print(f"📊 Estatísticas:")
+        print(f"  Total de tarefas: {total_rows}")
+        print(
+            f"  Tarefas com 0 horas planejadas: {zero_planned} ({zero_planned/total_rows*100:.1f}%)"
+        )
+        print(
+            f"  Tarefas com 0 horas reais: {zero_real} ({zero_real/total_rows*100:.1f}%)"
+        )
+
+        if negative_planned > 0 or negative_real > 0:
+            print(
+                f"⚠️ Valores negativos encontrados - Planejadas: {negative_planned}, Reais: {negative_real}"
+            )
+
+    return df_clean
+
+
+def export_to_excel_format(df_original, month_ref=None):
+    """
+    Converte os dados para o formato Excel com as colunas especificadas.
+    Remove a lógica de divisão de horas e usa estrutura simplificada.
+    Filtra apenas tarefas concluídas.
+    """
+    # Validar e limpar dados antes do processamento
+    df = validate_and_clean_hours_data(df_original)
+
+    # Filtrar apenas tarefas concluídas (mesma lógica do relatório de horas)
+    df_concluidas = df[df["state"].str.lower() == "concluído"]
+
+    # Lista para armazenar as linhas do Excel
+    excel_rows = []
+
+    # Contar tarefas com horas reais > 0 para estatísticas
+    tasks_with_real_hours = (df_concluidas["real_hours"] > 0).sum()
+
+    for _, row in df_concluidas.iterrows():
+        # Formatar horas reais no formato HH:MM:SS
+        real_hours = row["real_hours"]
+        hours_formatted = (
+            f"{int(real_hours):02d}:{int((real_hours % 1) * 60):02d}:00"
+            if real_hours > 0
+            else "00:00:00"
+        )
+
+        # Dados da linha
+        excel_data = {
+            "Estória": row.get("story.number", ""),
+            "Número": row.get("number", ""),
+            "Descrição resumida": row.get("short_description", ""),
+            "Estado": row.get("state", ""),
+            "Atribuído a": row.get("assigned_to", ""),
+            "Horas reais": hours_formatted,
+            "Sprint conclusão": row.get("story.sprint", ""),
+        }
+
+        excel_rows.append(excel_data)
+
+    # Criar DataFrame final
+    excel_df = pd.DataFrame(excel_rows)
+
+    # Ordenar por Sprint, Estória e Número
+    excel_df = excel_df.sort_values(
+        ["Sprint conclusão", "Estória", "Número"]
+    ).reset_index(drop=True)
+
+    return excel_df, tasks_with_real_hours, len(df_concluidas)
 
 
 def main():
@@ -638,20 +768,16 @@ def main():
 
                     # Preparar opções para filtros
                     status_options = ["Todos"] + sorted(
-                        df_tasks["state"].unique().tolist()
+                        [x for x in df_tasks["state"].unique() if x != ""]
                     )
                     epic_options = ["Todos"] + sorted(
-                        [
-                            epic
-                            for epic in df_tasks["story.epic"].unique()
-                            if pd.notna(epic) and epic != ""
-                        ]
+                        [epic for epic in df_tasks["story.epic"].unique() if epic != ""]
                     )
                     person_options = ["Todos"] + sorted(
-                        df_tasks["assigned_to"].unique().tolist()
+                        [x for x in df_tasks["assigned_to"].unique() if x != ""]
                     )
                     sprint_options = ["Todos"] + sorted(
-                        df_tasks["story.sprint"].unique().tolist()
+                        [x for x in df_tasks["story.sprint"].unique() if x != ""]
                     )
 
                     # Adicionar os filtros
@@ -921,14 +1047,95 @@ def main():
                             mime="text/csv",
                         )
 
-            # Download do relatório como CSV
-            csv_export = relatorio.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="Baixar relatório como CSV",
-                data=csv_export,
-                file_name="relatorio_horas.csv",
-                mime="text/csv",
+            # Seção de Exportação (após todas as abas)
+            st.markdown("---")
+            st.subheader("Exportar Dados")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Download do relatório como CSV
+                csv_export = relatorio.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📄 Baixar Relatório Resumo (CSV)",
+                    data=csv_export,
+                    file_name="relatorio_horas.csv",
+                    mime="text/csv",
+                )
+
+            with col2:
+                # Campo para definir mês de referência - removido pois não é mais necessário
+                pass
+
+            # Seção dedicada para Excel
+            st.markdown("### 📊 Exportação para Excel")
+            st.info(
+                "Exporta apenas as **tarefas concluídas** em formato Excel com as colunas: Estória, Número, Descrição resumida, Estado, Atribuído a, Horas reais, Sprint conclusão"
             )
+
+            # Gerar dados Excel automaticamente quando houver dados
+            try:
+                # Converter para formato Excel
+                excel_df, tasks_with_real_hours, total_completed_tasks = (
+                    export_to_excel_format(df_original)
+                )
+
+                # Criar arquivo Excel em memória
+                from io import BytesIO
+
+                excel_buffer = BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    # Aba com dados detalhados
+                    excel_df.to_excel(
+                        writer, sheet_name="Tarefas Concluídas", index=False
+                    )
+
+                excel_buffer.seek(0)
+
+                # Colunas para informações e download
+                info_col, download_col = st.columns([2, 1])
+
+                with info_col:
+                    st.success(
+                        f"✅ Arquivo Excel preparado com {len(excel_df)} tarefas concluídas"
+                    )
+
+                    # Informações sobre processamento de dados
+                    total_tasks_original = len(df_original)
+                    st.info(
+                        f"📋 {total_completed_tasks} de {total_tasks_original} tarefas estão concluídas ({total_completed_tasks/total_tasks_original*100:.1f}%)"
+                    )
+
+                    if tasks_with_real_hours > 0:
+                        st.info(
+                            f"⏱️ {tasks_with_real_hours} de {total_completed_tasks} tarefas concluídas têm horas reais > 0"
+                        )
+
+                with download_col:
+                    # Botão de download sempre disponível
+                    st.download_button(
+                        label="📥 Baixar Excel",
+                        data=excel_buffer.getvalue(),
+                        file_name=f"tarefas_concluidas_{datetime.datetime.now().strftime('%Y_%m_%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
+                # Preview dos dados Excel (opcional)
+                with st.expander("👁️ Preview dos dados Excel (primeiras 10 linhas)"):
+                    st.dataframe(excel_df.head(10), use_container_width=True)
+
+            except Exception as e:
+                st.error(f"❌ Erro ao gerar arquivo Excel: {str(e)}")
+                st.error(
+                    "Verifique se todos os dados necessários estão presentes no arquivo CSV."
+                )
+                # Debug info
+                with st.expander("🔍 Informações de Debug"):
+                    st.write("Colunas disponíveis no DataFrame:")
+                    st.write(list(df_original.columns))
+                    st.write("Primeiras 3 linhas do DataFrame original:")
+                    st.write(df_original.head(3))
 
         except Exception as e:
             st.error(f"Erro ao processar o arquivo: {e}")
